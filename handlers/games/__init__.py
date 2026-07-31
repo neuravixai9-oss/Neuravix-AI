@@ -1,3 +1,5 @@
+import html
+
 from . import engine
 from . import tictactoe, connect4, memory, guess, coinflip, reaction, rps, quiz
 
@@ -35,7 +37,7 @@ async def handle_join_game(message, room_id: str, bot=None, state=None):
         await message.answer("❌ Игра уже началась или завершена.")
         return
 
-    joiner_name = message.from_user.first_name or "Игрок"
+    joiner_name = html.escape(message.from_user.first_name or "Игрок")
     session = await engine.accept_friend_invite(room_id, message.from_user.id, joiner_name, bot=bot)
     if not session:
         await message.answer("❌ Не удалось присоединиться — приглашение уже неактуально.")

@@ -1,4 +1,5 @@
 import asyncio
+import html
 import io
 import os
 import zipfile
@@ -14,12 +15,15 @@ from database.db import (
     get_or_create_user, get_all_users, get_admins, get_subscribed_users,
     get_stats, set_admin, update_user, get_user_by_username, backup_database,
     get_users_page, search_users, set_banned, get_user,
+    get_shop_products, get_shop_product, create_shop_product, update_shop_product,
+    delete_shop_product, move_shop_product,
 )
 from keyboards.menus import (
     admin_panel_kb, manage_admins_kb, admin_sub_type_kb, subscribed_users_kb,
     back_to_main_kb, users_list_kb, user_detail_kb, user_search_results_kb, USERS_PAGE_SIZE,
+    DIVIDER,
 )
-from config import ADMIN_ID, SUPER_OWNER_ID, SUBSCRIPTION_LIMITS, VERSION, CHANGELOG
+from config import ADMIN_ID, SUPER_OWNER_ID, SUBSCRIPTION_LIMITS, VERSION
 
 router = Router()
 
@@ -31,6 +35,15 @@ class AdminState(StatesGroup):
     waiting_user_id_for_admin = State()
     waiting_broadcast = State()
     waiting_user_search = State()
+    # Мастер добавления товара в магазин
+    shop_add_name = State()
+    shop_add_description = State()
+    shop_add_price = State()
+    shop_add_duration = State()
+    shop_add_category = State()
+    shop_add_image = State()
+    # Редактирование одного поля существующего товара
+    shop_edit_field = State()
 
 
 def _is_protected(telegram_id: int, admin_ids: set) -> bool:
@@ -86,11 +99,7 @@ async def admin_panel(callback: CallbackQuery):
             if cnt:
                 text += f"  • {labels.get(sub_key, sub_key)}: <b>{cnt}</b>\n"
 
-    last = CHANGELOG[0] if CHANGELOG else None
     text += f"\n{'━' * 20}\n<i>Neuravix AI v{VERSION} • {date.today().strftime('%d.%m.%Y')}</i>"
-    if last:
-        changes = "\n".join(f"  • {c}" for c in last["changes"][:6])
-        text += f"\n\n📝 <b>Что нового в v{last['version']}:</b>\n{changes}"
 
     try:
         await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode="HTML")
@@ -198,8 +207,8 @@ async def user_view(callback: CallbackQuery):
     admin_ids = await _admin_ids_set()
     is_protected = _is_protected(target_id, admin_ids)
 
-    uname = f"@{target['username']}" if target.get("username") else "—"
-    name = target.get("first_name") or "—"
+    uname = f"@{html.escape(target['username'])}" if target.get("username") else "—"
+    name = html.escape(target.get("first_name") or "—")
     sub = SUBSCRIPTION_LIMITS.get(target.get("subscription", "free"), {}).get("label", "free")
     joined = (target.get("created_at") or "—")[:10]
     last_seen = (target.get("last_seen") or "")[:16].replace("T", " ") or "нет данных"
@@ -347,7 +356,7 @@ async def give_sub_get_user(message: Message, state: FSMContext):
 
     cur_sub = SUBSCRIPTION_LIMITS.get(target.get("subscription", "free"), {}).get("label", "—")
     await message.answer(
-        f"✅ Пользователь: <b>{target.get('first_name', '—')}</b> "
+        f"✅ Пользователь: <b>{html.escape(target.get('first_name') or '—')}</b> "
         f"(<code>{target['telegram_id']}</code>)\n"
         f"Текущий тариф: {cur_sub}\n\n"
         f"Выбери новый тариф:",
@@ -366,7 +375,7 @@ async def give_sub_confirm(callback: CallbackQuery, state: FSMContext):
     if not target_id or sub not in SUBSCRIPTION_LIMITS:
         await callback.answer("❌ Ошибка", show_alert=True)
         return
-    await update_user(target_id, subscription=sub)
+    await update_user(target_id, subscription=sub, subscription_expires_at="")  # ручная выдача — бессрочно
     info = SUBSCRIPTION_LIMITS[sub]
 
     # Уведомляем пользователя
@@ -421,7 +430,7 @@ async def remove_sub(callback: CallbackQuery):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
     target_id = int(callback.data.split(":", 2)[2])
-    await update_user(target_id, subscription="free")
+    await update_user(target_id, subscription="free", subscription_expires_at="")
     await callback.answer("✅ Подписка удалена — выставлен Free")
 
     # Уведомляем пользователя
@@ -473,7 +482,7 @@ async def give_elite_confirm(message: Message, state: FSMContext):
     if not target:
         await message.answer("❌ Пользователь не найден.", reply_markup=back_to_main_kb())
         return
-    await update_user(target["telegram_id"], subscription="creator_elite")
+    await update_user(target["telegram_id"], subscription="creator_elite", subscription_expires_at="")
     try:
         await message.bot.send_message(
             target["telegram_id"],
@@ -484,7 +493,7 @@ async def give_elite_confirm(message: Message, state: FSMContext):
     except Exception:
         pass
     await message.answer(
-        f"👑 Creator Elite выдан: <b>{target.get('first_name', raw)}</b> (<code>{target['telegram_id']}</code>)",
+        f"👑 Creator Elite выдан: <b>{html.escape(target.get('first_name') or raw)}</b> (<code>{target['telegram_id']}</code>)",
         reply_markup=admin_panel_kb(), parse_mode="HTML",
     )
 
@@ -551,7 +560,7 @@ async def add_admin_confirm(message: Message, state: FSMContext):
     except Exception:
         pass
     await message.answer(
-        f"✅ <b>{target.get('first_name', raw)}</b> назначен администратором.",
+        f"✅ <b>{html.escape(target.get('first_name') or raw)}</b> назначен администратором.",
         reply_markup=admin_panel_kb(), parse_mode="HTML",
     )
 
@@ -701,3 +710,475 @@ async def _resolve_user(raw: str) -> dict | None:
         return await get_user(uid)
     except ValueError:
         return await get_user_by_username(raw)
+
+
+# ── Управление магазином ──────────────────────────────────────────────────────
+# Полный CRUD товаров прямо из Telegram, без единой правки кода. Новые типы
+# товаров (не только подписки) можно добавлять — просто при создании выбрать
+# "Не выдаёт подписку", и товар будет продаваться как есть (с автосообщением
+# после оплаты); чтобы товар что-то ВЫДАВАЛ автоматически, нужно добавить
+# соответствующую логику в handlers/shop.py:successful_payment — это
+# единственное, что неизбежно требует кода (сам каталог полностью в БД).
+
+SHOP_PAGE_SIZE = 8
+
+
+def _shop_admin_list_kb(products: list, offset: int, total: int) -> "InlineKeyboardMarkup":
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    rows = []
+    for p in products[offset:offset + SHOP_PAGE_SIZE]:
+        mark = "✅" if p["is_visible"] else "🙈"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {p['name']} — {p['price_stars']}⭐",
+            callback_data=f"admin:shop:view:{p['product_key']}",
+        )])
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"admin:shop:list:{max(0, offset - SHOP_PAGE_SIZE)}"))
+    if offset + SHOP_PAGE_SIZE < total:
+        nav.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"admin:shop:list:{offset + SHOP_PAGE_SIZE}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="➕ Добавить товар", callback_data="admin:shop:add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Панель", callback_data="admin:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data.startswith("admin:shop:list:"))
+async def shop_admin_list(callback: CallbackQuery, state: FSMContext):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    offset = int(callback.data.split(":")[3])
+    products = await get_shop_products(visible_only=False)
+
+    text = (
+        f"🛠 <b>Управление магазином</b>\n{DIVIDER}\n\n"
+        f"Всего товаров: <b>{len(products)}</b>\n"
+        f"✅ — видимый · 🙈 — скрытый\n\n"
+        f"Нажми на товар, чтобы отредактировать."
+    )
+    kb = _shop_admin_list_kb(products, offset, len(products))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+def _shop_admin_detail_kb(p: dict) -> "InlineKeyboardMarkup":
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    key = p["product_key"]
+    vis_text = "🙈 Скрыть" if p["is_visible"] else "✅ Показать"
+    perm_text = "⏳ Сделать временным" if p["is_permanent"] else "♾️ Сделать постоянным"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Название", callback_data=f"admin:shop:edit:name:{key}"),
+         InlineKeyboardButton(text="✏️ Описание", callback_data=f"admin:shop:edit:description:{key}")],
+        [InlineKeyboardButton(text="✏️ Цена (⭐)", callback_data=f"admin:shop:edit:price_stars:{key}"),
+         InlineKeyboardButton(text="✏️ Категория", callback_data=f"admin:shop:edit:category:{key}")],
+        [InlineKeyboardButton(text="🖼 Изображение", callback_data=f"admin:shop:edit:image:{key}")],
+        [InlineKeyboardButton(text=vis_text, callback_data=f"admin:shop:toggle_visible:{key}"),
+         InlineKeyboardButton(text=perm_text, callback_data=f"admin:shop:toggle_permanent:{key}")],
+        [InlineKeyboardButton(text="⬆️ Выше", callback_data=f"admin:shop:move:up:{key}"),
+         InlineKeyboardButton(text="⬇️ Ниже", callback_data=f"admin:shop:move:down:{key}")],
+        [InlineKeyboardButton(text="🗑 Удалить товар", callback_data=f"admin:shop:delete_confirm:{key}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="admin:shop:list:0")],
+    ])
+
+
+def _shop_admin_detail_text(p: dict) -> str:
+    benefits = "\n".join(f"  • {b}" for b in (p.get("benefits") or []))
+    grants = f"подписка «{p['grants_subscription']}»" if p.get("grants_subscription") else "ничего автоматически (обычный товар)"
+    expiry = f"\n⏰ Действует до: <b>{p['expires_at'][:10]}</b>" if (not p["is_permanent"] and p.get("expires_at")) else ""
+    return (
+        f"🛍 <b>{p['name']}</b>\n{DIVIDER}\n\n"
+        f"🔑 Ключ: <code>{p['product_key']}</code>\n"
+        f"💰 Цена: <b>{p['price_stars']} ⭐</b>\n"
+        f"📁 Категория: <b>{p.get('category') or '—'}</b>\n"
+        f"👁 Видимость: {'✅ Видим покупателям' if p['is_visible'] else '🙈 Скрыт'}\n"
+        f"⏳ Тип: {'♾️ Постоянный' if p['is_permanent'] else '⏳ Временный'}{expiry}\n"
+        f"🎁 При покупке выдаёт: {grants}\n"
+        f"🖼 Изображение: {'есть' if p.get('image_file_id') else 'нет'}\n\n"
+        f"<i>{p.get('description') or 'без описания'}</i>\n"
+        f"{benefits}"
+    )
+
+
+@router.callback_query(F.data.startswith("admin:shop:view:"))
+async def shop_admin_view(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    product_key = callback.data.split(":", 3)[3]
+    p = await get_shop_product(product_key)
+    if not p:
+        await callback.answer("❌ Товар не найден", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(
+            _shop_admin_detail_text(p), reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+        )
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(
+            _shop_admin_detail_text(p), reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:shop:toggle_visible:"))
+async def shop_toggle_visible(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    product_key = callback.data.split(":", 3)[3]
+    p = await get_shop_product(product_key)
+    if not p:
+        await callback.answer("❌ Товар не найден", show_alert=True)
+        return
+    await update_shop_product(product_key, is_visible=0 if p["is_visible"] else 1)
+    await callback.answer("✅ Изменено")
+    await shop_admin_view(callback)
+
+
+@router.callback_query(F.data.startswith("admin:shop:toggle_permanent:"))
+async def shop_toggle_permanent(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    product_key = callback.data.split(":", 3)[3]
+    p = await get_shop_product(product_key)
+    if not p:
+        await callback.answer("❌ Товар не найден", show_alert=True)
+        return
+    new_permanent = 0 if p["is_permanent"] else 1
+    fields = {"is_permanent": new_permanent}
+    if new_permanent:
+        fields["expires_at"] = ""  # снова постоянный — срок действия снимается
+    await update_shop_product(product_key, **fields)
+    await callback.answer("✅ Изменено. Дату окончания можно задать через 'Описание' при необходимости.")
+    await shop_admin_view(callback)
+
+
+@router.callback_query(F.data.startswith("admin:shop:move:"))
+async def shop_move(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    _, _, _, direction, product_key = callback.data.split(":", 4)
+    moved = await move_shop_product(product_key, direction)
+    await callback.answer("✅ Перемещено" if moved else "Уже крайний в списке")
+    await shop_admin_view(callback)
+
+
+@router.callback_query(F.data.startswith("admin:shop:delete_confirm:"))
+async def shop_delete_confirm(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    product_key = callback.data.split(":", 3)[3]
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"admin:shop:delete:{product_key}"),
+         InlineKeyboardButton(text="✖️ Отмена", callback_data=f"admin:shop:view:{product_key}")],
+    ])
+    try:
+        await callback.message.edit_text(
+            "🗑 <b>Удалить товар безвозвратно?</b>\n\nЭто не затронет уже купивших его пользователей.",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:shop:delete:"))
+async def shop_delete(callback: CallbackQuery):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    product_key = callback.data.split(":", 3)[3]
+    await delete_shop_product(product_key)
+    await callback.answer("🗑 Товар удалён")
+
+    products = await get_shop_products(visible_only=False)
+    text = (
+        f"🛠 <b>Управление магазином</b>\n{DIVIDER}\n\n"
+        f"Всего товаров: <b>{len(products)}</b>\n"
+        f"✅ — видимый · 🙈 — скрытый\n\n"
+        f"Нажми на товар, чтобы отредактировать."
+    )
+    kb = _shop_admin_list_kb(products, 0, len(products))
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+_SHOP_FIELD_PROMPTS = {
+    "name": "✏️ Введи новое <b>название</b> товара:",
+    "description": "✏️ Введи новое <b>описание</b> товара:",
+    "price_stars": "✏️ Введи новую <b>цену в Telegram Stars</b> (целое число):",
+    "category": "✏️ Введи новую <b>категорию</b> (например: Подписки, Бонусы):",
+    "image": "🖼 Пришли новое <b>изображение</b> товара (просто отправь фото в этот чат):",
+}
+
+
+@router.callback_query(F.data.startswith("admin:shop:edit:"))
+async def shop_edit_start(callback: CallbackQuery, state: FSMContext):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    _, _, _, field, product_key = callback.data.split(":", 4)
+    if field not in _SHOP_FIELD_PROMPTS:
+        await callback.answer("❌ Неизвестное поле", show_alert=True)
+        return
+
+    await state.update_data(shop_edit_field=field, shop_edit_key=product_key)
+    await state.set_state(AdminState.shop_edit_field)
+
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data=f"admin:shop:view:{product_key}")],
+    ])
+    try:
+        await callback.message.edit_text(_SHOP_FIELD_PROMPTS[field], reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(_SHOP_FIELD_PROMPTS[field], reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(AdminState.shop_edit_field)
+async def shop_edit_process(message: Message, state: FSMContext):
+    user = await get_or_create_user(message.from_user.id)
+    if not _is_admin(user):
+        await state.clear()
+        return
+    data = await state.get_data()
+    field = data.get("shop_edit_field")
+    product_key = data.get("shop_edit_key")
+    if not field or not product_key:
+        await state.clear()
+        return
+
+    if field == "image":
+        if not message.photo:
+            await message.answer("⚠️ Это должно быть фото. Пришли изображение или нажми «Отмена» в сообщении выше.")
+            return
+        file_id = message.photo[-1].file_id
+        await update_shop_product(product_key, image_file_id=file_id)
+    elif field == "price_stars":
+        try:
+            value = int(message.text.strip())
+            if value <= 0:
+                raise ValueError
+        except (ValueError, AttributeError):
+            await message.answer("⚠️ Нужно целое положительное число. Попробуй ещё раз:")
+            return
+        await update_shop_product(product_key, price_stars=value)
+    else:
+        value = (message.text or "").strip()
+        if not value:
+            await message.answer("⚠️ Значение не может быть пустым. Попробуй ещё раз:")
+            return
+        await update_shop_product(product_key, **{field: value})
+
+    await state.clear()
+    p = await get_shop_product(product_key)
+    if not p:
+        await message.answer("❌ Товар не найден (возможно, был удалён).", reply_markup=admin_panel_kb())
+        return
+    await message.answer(
+        f"✅ Обновлено!\n\n{_shop_admin_detail_text(p)}",
+        reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+    )
+
+
+# ── Мастер добавления товара ────────────────────────────────────────────────
+
+@router.callback_query(F.data == "admin:shop:add")
+async def shop_add_start(callback: CallbackQuery, state: FSMContext):
+    user = await get_or_create_user(callback.from_user.id)
+    if not _is_admin(user):
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminState.shop_add_name)
+    await state.update_data(shop_new={})
+
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data="admin:shop:list:0")],
+    ])
+    try:
+        await callback.message.edit_text(
+            f"➕ <b>Новый товар</b> (шаг 1/5)\n{DIVIDER}\n\nВведи <b>название</b> товара:",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.answer(
+            f"➕ <b>Новый товар</b> (шаг 1/5)\n{DIVIDER}\n\nВведи <b>название</b> товара:",
+            reply_markup=kb, parse_mode="HTML",
+        )
+    await callback.answer()
+
+
+@router.message(AdminState.shop_add_name, F.text)
+async def shop_add_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if not name:
+        await message.answer("⚠️ Название не может быть пустым. Попробуй ещё раз:")
+        return
+    data = await state.get_data()
+    new = data.get("shop_new", {})
+    new["name"] = name
+    await state.update_data(shop_new=new)
+    await state.set_state(AdminState.shop_add_description)
+    await message.answer(
+        f"➕ <b>Новый товар</b> (шаг 2/5)\n{DIVIDER}\n\n"
+        f"Введи <b>описание</b> товара (или отправь «-», чтобы оставить пустым):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminState.shop_add_description, F.text)
+async def shop_add_description(message: Message, state: FSMContext):
+    desc = message.text.strip()
+    data = await state.get_data()
+    new = data.get("shop_new", {})
+    new["description"] = "" if desc == "-" else desc
+    await state.update_data(shop_new=new)
+    await state.set_state(AdminState.shop_add_price)
+    await message.answer(
+        f"➕ <b>Новый товар</b> (шаг 3/5)\n{DIVIDER}\n\n"
+        f"Введи <b>цену в Telegram Stars</b> (целое число, например 150):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminState.shop_add_price, F.text)
+async def shop_add_price(message: Message, state: FSMContext):
+    try:
+        price = int(message.text.strip())
+        if price <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("⚠️ Нужно целое положительное число. Попробуй ещё раз:")
+        return
+    data = await state.get_data()
+    new = data.get("shop_new", {})
+    new["price_stars"] = price
+    await state.update_data(shop_new=new)
+    await state.set_state(AdminState.shop_add_category)
+    await message.answer(
+        f"➕ <b>Новый товар</b> (шаг 4/5)\n{DIVIDER}\n\n"
+        f"Введи <b>категорию</b> (например: Подписки, Бонусы, Разное):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminState.shop_add_category, F.text)
+async def shop_add_category(message: Message, state: FSMContext):
+    category = message.text.strip() or "Общее"
+    data = await state.get_data()
+    new = data.get("shop_new", {})
+    new["category"] = category
+    await state.update_data(shop_new=new)
+    await state.set_state(AdminState.shop_add_image)
+
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить (без изображения)", callback_data="admin:shop:add:skip_image")],
+    ])
+    await message.answer(
+        f"➕ <b>Новый товар</b> (шаг 5/5)\n{DIVIDER}\n\n"
+        f"Пришли <b>изображение</b> товара или нажми «Пропустить»:",
+        reply_markup=kb, parse_mode="HTML",
+    )
+
+
+async def _finish_shop_add(state: FSMContext, image_file_id: str = "") -> dict:
+    """Создаёт товар в БД из накопленных данных мастера и возвращает его."""
+    import re
+    import uuid as _uuid
+    data = await state.get_data()
+    new = data.get("shop_new", {})
+
+    slug = re.sub(r"[^a-z0-9]+", "_", new.get("name", "product").lower()).strip("_") or "product"
+    product_key = f"{slug}_{_uuid.uuid4().hex[:6]}"
+
+    products = await get_shop_products(visible_only=False)
+    max_order = max((p["display_order"] for p in products), default=0)
+
+    await create_shop_product(
+        product_key,
+        product_type="custom",
+        grants_subscription="",
+        name=new.get("name", "Товар"),
+        description=new.get("description", ""),
+        benefits="[]",
+        price_stars=new.get("price_stars", 1),
+        duration_days=0,
+        image_file_id=image_file_id,
+        category=new.get("category", "Общее"),
+        is_visible=1,
+        is_permanent=1,
+        expires_at="",
+        display_order=max_order + 10,
+    )
+    await state.clear()
+    return await get_shop_product(product_key)
+
+
+@router.callback_query(F.data == "admin:shop:add:skip_image", AdminState.shop_add_image)
+async def shop_add_skip_image(callback: CallbackQuery, state: FSMContext):
+    p = await _finish_shop_add(state)
+    await callback.answer("✅ Товар создан!")
+    try:
+        await callback.message.edit_text(
+            f"✅ <b>Товар создан!</b>\n\n{_shop_admin_detail_text(p)}\n\n"
+            f"💡 По умолчанию товар не выдаёт подписку автоматически — он "
+            f"продаётся как обычный товар. Если это подписка, обратись за "
+            f"доработкой логики выдачи.",
+            reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+        )
+    except Exception:
+        await callback.message.answer(
+            f"✅ <b>Товар создан!</b>\n\n{_shop_admin_detail_text(p)}",
+            reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+        )
+
+
+@router.message(AdminState.shop_add_image, F.photo)
+async def shop_add_image(message: Message, state: FSMContext):
+    file_id = message.photo[-1].file_id
+    p = await _finish_shop_add(state, image_file_id=file_id)
+    await message.answer(
+        f"✅ <b>Товар создан!</b>\n\n{_shop_admin_detail_text(p)}",
+        reply_markup=_shop_admin_detail_kb(p), parse_mode="HTML",
+    )
+
+
+@router.message(AdminState.shop_add_image)
+async def shop_add_image_wrong_type(message: Message, state: FSMContext):
+    await message.answer("⚠️ Пришли именно фото, либо нажми «Пропустить» в сообщении выше.")

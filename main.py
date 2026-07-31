@@ -24,7 +24,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery
 
 from config import BOT_TOKEN, SUPER_OWNER_ID, GAME_INVITE_TTL_MINUTES, validate_env
-from database.db import init_db
+from database.db import init_db, backup_database, seed_default_shop_products
+from database.db_backend import USE_POSTGRES, init_pg_pool, close_pg_pool
 
 # Роутеры
 from handlers.start import router as start_router
@@ -38,6 +39,7 @@ from handlers.settings_handler import router as settings_router
 from handlers.help_handler import router as help_router
 from handlers.admin import router as admin_router
 from handlers.games.menu import router as games_menu_router
+from handlers.easter_eggs import router as easter_eggs_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,9 +68,52 @@ async def cleanup_expired_invites(bot: Bot):
                 except Exception:
                     pass
                 await delete_game_session(session["game_id"])
+                try:
+                    from handlers.games.engine import _release_game_lock
+                    _release_game_lock(session["game_id"])
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning(f"Ошибка очистки инвайтов: {e}")
         await asyncio.sleep(60)
+
+
+async def notify_expiring_subscriptions(bot: Bot):
+    """
+    Система уведомлений: раз в несколько часов проверяет, у кого платная
+    подписка истекает в ближайшие 3 дня, и присылает напоминание — чтобы
+    пользователь успел продлить и не потерял доступ неожиданно.
+    """
+    from database.db import get_users_expiring_soon, mark_expiry_notified
+    from config import SUBSCRIPTION_LIMITS
+
+    while True:
+        try:
+            expiring = await get_users_expiring_soon(days=3)
+            for user in expiring:
+                sub = user.get("subscription", "free")
+                label = SUBSCRIPTION_LIMITS.get(sub, {}).get("label", sub)
+                try:
+                    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="🛒 Продлить в магазине", callback_data="menu:shop")],
+                    ])
+                    await bot.send_message(
+                        user["telegram_id"],
+                        f"🔔 <b>Подписка скоро закончится</b>\n\n"
+                        f"Твой тариф <b>{label}</b> истекает уже через несколько дней. "
+                        f"Продли заранее, чтобы не потерять текущие лимиты и возможности.",
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass  # заблокировал бота или недоступен — не критично, пробуем в следующий раз других
+                # Отмечаем отправленным независимо от результата доставки —
+                # иначе при заблокированном боте будем бесконечно пытаться каждый цикл.
+                await mark_expiry_notified(user["telegram_id"])
+        except Exception as e:
+            logger.warning(f"Ошибка отправки напоминаний об истечении подписки: {e}")
+        await asyncio.sleep(6 * 60 * 60)  # раз в 6 часов достаточно для окна в 3 дня
 
 
 async def main():
@@ -88,8 +133,30 @@ async def main():
         logger.warning(f"⚠️ {msg}")
 
     logger.info("🚀 Neuravix AI запускается…")
+    logger.info(
+        f"🗄️ База данных: {'PostgreSQL (DATABASE_URL)' if USE_POSTGRES else 'SQLite (локальный файл)'}"
+    )
+
+    if USE_POSTGRES:
+        await init_pg_pool()
+
+    # Резервная копия БД перед миграциями — если что-то пойдёт не так при
+    # обновлении схемы, данные всегда можно восстановить из свежего бэкапа.
+    # Первый запуск (файла БД ещё нет) — backup_database сама вернёт None,
+    # это нормально, ошибкой не считается. Для PostgreSQL функция ничего не
+    # делает — резервным копированием там управляет сам Railway.
+    try:
+        backup_path = backup_database()
+        if backup_path:
+            logger.info(f"💾 Резервная копия БД создана: {backup_path}")
+        elif USE_POSTGRES:
+            logger.info("💾 PostgreSQL: резервные копии обеспечивает сам Railway")
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось создать резервную копию БД перед запуском: {e!r}")
+
     await init_db()
-    logger.info("✅ База данных инициализирована")
+    await seed_default_shop_products()
+    logger.info("✅ База данных инициализирована (миграции применены, данные сохранены)")
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -106,6 +173,7 @@ async def main():
 
     # Регистрируем роутеры в правильном порядке
     dp.include_router(admin_router)
+    dp.include_router(easter_eggs_router)
     dp.include_router(start_router)
     dp.include_router(ai_chat_router)
     dp.include_router(image_gen_router)
@@ -161,14 +229,25 @@ async def main():
         game_id = parts[2]
         from database.db import update_game_session, get_game_session as _gs
         from handlers.games.reaction import schedule_reaction_round
+        from handlers.games.engine import _get_game_lock
 
-        session = await _gs(game_id)
-        if not session or session["status"] != "active":
-            await callback.answer("Игра не активна", show_alert=True)
-            return
-        state = session["state"]
-        state["phase"] = "waiting"
-        await update_game_session(game_id, state=state)
+        # Блокировка на конкретную игру + явный флаг "_round_scheduled" —
+        # защита от двойного нажатия: без этого быстрый повторный тап по
+        # "Начать раунд!" мог запустить ДВА параллельных таймера на одну и
+        # ту же игру (двойной раунд, сбитый счёт, зависания).
+        async with _get_game_lock(game_id):
+            session = await _gs(game_id)
+            if not session or session["status"] != "active":
+                await callback.answer("Игра не активна", show_alert=True)
+                return
+            state = session["state"]
+            if state.get("_round_scheduled"):
+                await callback.answer("⏳ Раунд уже запускается, подожди…")
+                return
+            state["_round_scheduled"] = True
+            state["phase"] = "waiting"
+            await update_game_session(game_id, state=state)
+
         await callback.answer("▶️ Раунд начинается! Жди кнопку…")
         asyncio.create_task(schedule_reaction_round(session, bot))
 
@@ -214,8 +293,42 @@ async def main():
     dp.message.middleware(BotMiddleware(bot))
     dp.callback_query.middleware(BotMiddleware(bot))
 
+    # Глобальный обработчик ошибок: ловит АБСОЛЮТНО ЛЮБОЕ необработанное
+    # исключение из любого хендлера бота (даже если конкретный разработчик
+    # забыл обернуть код в try/except), полностью логирует его в Railway Logs
+    # и вежливо отвечает пользователю вместо молчания или падения бота.
+    from aiogram.types import ErrorEvent
+
+    @dp.errors()
+    async def global_error_handler(event: ErrorEvent) -> bool:
+        logger.error(
+            "Необработанная ошибка при обработке апдейта %s: %r",
+            getattr(event.update, "update_id", "?"), event.exception,
+            exc_info=event.exception,
+        )
+        try:
+            target_message = None
+            if event.update.message:
+                target_message = event.update.message
+            elif event.update.callback_query and event.update.callback_query.message:
+                target_message = event.update.callback_query.message
+            if target_message:
+                await target_message.answer(
+                    "❌ Произошла непредвиденная ошибка. Мы уже знаем о проблеме — "
+                    "попробуй ещё раз через несколько секунд."
+                )
+            if event.update.callback_query:
+                try:
+                    await event.update.callback_query.answer()
+                except Exception:
+                    pass
+        except Exception:
+            pass  # даже уведомление не должно уронить обработчик ошибок
+        return True  # ошибка обработана — бот продолжает работу как ни в чём не бывало
+
     # Запускаем фоновые задачи
     asyncio.create_task(cleanup_expired_invites(bot))
+    asyncio.create_task(notify_expiring_subscriptions(bot))
 
     logger.info("✅ Neuravix AI готов к работе!")
     logger.info(f"👑 Владелец: ID {SUPER_OWNER_ID}")
@@ -223,11 +336,13 @@ async def main():
     try:
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "callback_query", "inline_query"],
+            allowed_updates=["message", "callback_query", "inline_query", "pre_checkout_query"],
             drop_pending_updates=True,
         )
     finally:
         await bot.session.close()
+        if USE_POSTGRES:
+            await close_pg_pool()
         logger.info("🔴 Бот остановлен")
 
 

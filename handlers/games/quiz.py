@@ -69,8 +69,8 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         else:
             out = state.get("_outcome", "draw")
             header += outcome_text(out, session, for_user_id) + "\n\n"
-        rows = [[InlineKeyboardButton(text="🔄 Играть снова", callback_data=f"game:rematch:{game_id}")],
-                [InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")]]
+        from handlers.games.engine import end_game_buttons
+        rows = end_game_buttons(game_id)
         players_line = "" if solo else f"🔵 <b>{p1_name}</b>: {p1s}  |  🔴 <b>{p2_name}</b>: {p2s}\n\n"
         return header + players_line, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -98,7 +98,8 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         data = f"g:quiz:{game_id}:{i}" if can_answer else f"g:quiz:{game_id}:noop"
         rows.append([InlineKeyboardButton(text=f"{LETTERS[i]} {opt}", callback_data=data)])
     rows.append([InlineKeyboardButton(text="🏳️ Завершить игру", callback_data=f"g:quiz:{game_id}:surrender")])
-    rows.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+    from handlers.games.engine import in_progress_buttons
+    rows.append(in_progress_buttons(game_id))
 
     return header + players_line, InlineKeyboardMarkup(inline_keyboard=rows)
 

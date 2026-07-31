@@ -60,8 +60,11 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton(text="🔵 Решка", callback_data=f"g:coinflip:{game_id}:tails"),
         ])
     if is_done:
-        buttons.append([InlineKeyboardButton(text="🔄 Реванш", callback_data=f"game:rematch:{game_id}")])
-    buttons.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        from handlers.games.engine import end_game_buttons
+        buttons.extend(end_game_buttons(game_id))
+    else:
+        from handlers.games.engine import in_progress_buttons
+        buttons.append(in_progress_buttons(game_id))
 
     text = header + players_line
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -70,27 +73,41 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def handle_move(session: dict, payload: str, user_id: int) -> tuple[dict, str | None]:
     state = session["state"]
     p1 = session["player1_id"]
+    p2 = session.get("player2_id") or BOT_ID
     is_p1 = user_id == p1
     mode = session.get("mode", "bot")
 
     if payload in ("heads", "tails"):
-        # Player 1 picks side
-        state["player1_choice"] = payload
-        if mode == "bot":
-            result = random.choice(["heads", "tails"])
-        else:
-            result = random.choice(["heads", "tails"])
+        # Серверная проверка очереди хода — раньше её не было, из-за чего
+        # ход НИКОГДА не переключался ко второму игроку (current_turn не
+        # менялся), и в режиме с другом второй игрок фактически не мог
+        # ходить, а победы всегда засчитывались первому игроку.
+        if user_id != session.get("current_turn"):
+            return session, None
+
+        state["player1_choice"] = payload  # для истории/отладки
+        result = random.choice(["heads", "tails"])
 
         coin = "🦅 Орёл" if result == "heads" else "🔵 Решка"
         choice_str = "🦅 Орёл" if payload == "heads" else "🔵 Решка"
 
-        p1_wins_round = (result == payload)
-        state["last_result"] = f"{coin} | Ты выбрал: {choice_str} → {'✅ Победа' if p1_wins_round else '❌ Поражение'}"
+        guesser_won = (result == payload)
+        who = state.get("player1_name") if is_p1 else state.get("player2_name")
+        state["last_result"] = (
+            f"{coin} | {who} выбрал: {choice_str} → "
+            f"{'✅ Победа' if guesser_won else '❌ Поражение'}"
+        )
 
-        if p1_wins_round:
-            state["player1_wins"] += 1
+        if guesser_won:
+            if is_p1:
+                state["player1_wins"] += 1
+            else:
+                state["player2_wins"] += 1
         else:
-            state["player2_wins"] += 1
+            if is_p1:
+                state["player2_wins"] += 1
+            else:
+                state["player1_wins"] += 1
 
         state["rounds"] += 1
         rounds = state["rounds"]
@@ -108,7 +125,9 @@ def handle_move(session: dict, payload: str, user_id: int) -> tuple[dict, str | 
             state["_outcome"] = out
             return session, out
 
-        # Continue
+        # Следующий раунд — очередь переходит к другому игроку (в bot-режиме
+        # это BOT_ID, и process_move сам вызовет bot_move()).
+        session["current_turn"] = p2 if is_p1 else p1
         return session, None
 
     return session, None

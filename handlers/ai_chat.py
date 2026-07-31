@@ -247,7 +247,9 @@ async def search_chats_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AIChatState.waiting_search)
     try:
         await callback.message.edit_text(
-            "🔎 <b>Поиск диалогов</b>\n\nВведи слово из названия диалога:",
+            "🔎 <b>Поиск по истории</b>\n\n"
+            "Введи слово или фразу — найду диалоги по названию "
+            "<b>и по содержимому переписки</b> внутри них:",
             reply_markup=back_to_main_kb(),
             parse_mode="HTML",
         )
@@ -315,6 +317,8 @@ async def _run_generation(
     file_name: str | None,
     file_mime: str | None,
     bot,
+    language: str = "ru",
+    response_style: str = "default",
 ):
     from services.ai_service import stream_chat, AIError, generate_title, ToolCall
 
@@ -328,7 +332,7 @@ async def _run_generation(
         async for piece in stream_chat(
             history, model=model, max_tokens=max_tokens, use_search=use_search,
             file_bytes=file_bytes, file_name=file_name, file_mime=file_mime,
-            user_id=user_id,
+            user_id=user_id, language=language, response_style=response_style,
         ):
             if isinstance(piece, ToolCall):
                 tool_call = piece
@@ -339,9 +343,12 @@ async def _run_generation(
             if now - last_edit >= EDIT_INTERVAL:
                 last_edit = now
                 display = (buffer[:3900] + "…") if len(buffer) > 3900 else buffer
+                # Курсор в конце — визуально показывает, что ответ ещё печатается
+                # (как в большинстве современных нейросетей), а не просто "завис".
+                display_with_cursor = f"{display} ▌" if display else "⏳"
                 try:
                     await placeholder.edit_text(
-                        display or "⏳",
+                        display_with_cursor,
                         reply_markup=stop_generation_kb(chat_id),
                         parse_mode=None,
                     )
@@ -429,7 +436,7 @@ async def _execute_tool_call(
     пользователю готовый результат — без отдельных кнопок и режимов."""
     from services.ai_service import generate_image, edit_image, AIError, generate_title
     from services.file_tools import build_file
-    from database.db import can_generate_image, increment_image_count
+    from database.db import can_generate_image, increment_image_count, increment_file_count
 
     name = tool_call.name
     args = tool_call.args
@@ -532,6 +539,7 @@ async def _execute_tool_call(
                 parse_mode="HTML",
             )
             summary = f"[Создан файл {final_name}]"
+            await increment_file_count(user_id)
 
         else:
             raise AIError("⚠️ <b>Не удалось выполнить запрос.</b>\n\nПопробуй сформулировать иначе.")
@@ -628,6 +636,12 @@ async def handle_ai_message(message: Message, state: FSMContext, bot=None):
 
     model = SUBSCRIPTION_LIMITS[sub]["model"]
     max_tokens = SUBSCRIPTION_LIMITS[sub]["max_tokens"]
+    if user.get("model_preference") == "fast":
+        from config import UTILITY_MODEL
+        model = UTILITY_MODEL
+
+    language = user.get("language") or "ru"
+    response_style = user.get("response_style") or "default"
 
     placeholder = await message.answer(
         "⏳ <i>Думаю…</i>",
@@ -638,6 +652,7 @@ async def handle_ai_message(message: Message, state: FSMContext, bot=None):
     task = asyncio.create_task(_run_generation(
         message.from_user.id, chat_id, placeholder, history, model, max_tokens,
         use_search, file_bytes, file_name, file_mime, bot,
+        language, response_style,
     ))
     active_generations[message.from_user.id] = {"task": task, "chat_id": chat_id}
 

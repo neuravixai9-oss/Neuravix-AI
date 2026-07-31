@@ -129,10 +129,12 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         buttons.append(col_btns)
 
     if is_done:
-        buttons.append([InlineKeyboardButton(text="🔄 Реванш", callback_data=f"game:rematch:{game_id}")])
+        from handlers.games.engine import end_game_buttons
+        buttons.extend(end_game_buttons(game_id))
     else:
         buttons.append([InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"g:connect4:{game_id}:surrender")])
-    buttons.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        from handlers.games.engine import in_progress_buttons
+        buttons.append(in_progress_buttons(game_id))
 
     board_text = "\n".join(board_lines)
     text = header + players_line + f"<code>{board_text}</code>"
@@ -146,6 +148,11 @@ def handle_move(session: dict, payload: str, user_id: int) -> tuple[dict, str | 
         out = "win_p2" if user_id == session["player1_id"] else "win_p1"
         session["state"]["_outcome"] = out
         return session, out
+
+    # Серверная проверка очереди хода — доп. защита сверх UI-блокировки кнопок.
+    if user_id != session.get("current_turn"):
+        return session, None
+
     try:
         col = int(payload)
     except ValueError:

@@ -1,4 +1,5 @@
 import asyncio
+import html
 
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
@@ -23,8 +24,7 @@ async def open_games_menu(callback: CallbackQuery):
         await callback.message.edit_text(
             "🎮 <b>Игровой центр</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "Играй против умного бота или пригласи друга!\n\n"
-            "Выбери игру:",
+            "8 игр — против умного бота или с другом. Выбери:",
             reply_markup=games_menu_kb(has_active=bool(active)),
             parse_mode="HTML",
         )
@@ -107,7 +107,7 @@ async def start_vs_bot(callback: CallbackQuery, bot=None):
         username=callback.from_user.username,
         first_name=callback.from_user.first_name,
     )
-    name1 = callback.from_user.first_name or "Игрок"
+    name1 = html.escape(callback.from_user.first_name or "Игрок")
     session = await engine.create_session(
         game_type, callback.from_user.id, name1, mode="bot",
         player2_id=engine.BOT_ID, player2_name="🤖 Бот", extra=extra,
@@ -128,7 +128,7 @@ async def start_vs_friend(callback: CallbackQuery, bot=None):
         username=callback.from_user.username,
         first_name=callback.from_user.first_name,
     )
-    name1 = callback.from_user.first_name or "Игрок"
+    name1 = html.escape(callback.from_user.first_name or "Игрок")
     session = await engine.create_session(
         game_type, callback.from_user.id, name1, mode="friend", extra=extra,
     )

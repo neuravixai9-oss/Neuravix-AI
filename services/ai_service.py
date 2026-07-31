@@ -15,7 +15,8 @@ from google.genai import errors as genai_errors
 
 from config import (
     GEMINI_API_KEY, IMAGE_GEN_MODELS, UTILITY_MODEL,
-    CHAT_FALLBACK_MODEL, SUPPORT_USERNAME, SUPER_OWNER_ID, SUPER_OWNER_USERNAME,
+    CHAT_FALLBACK_MODELS, SUPPORT_USERNAME, SUPER_OWNER_ID, SUPER_OWNER_USERNAME,
+    LANGUAGES, RESPONSE_STYLES,
 )
 
 logger = logging.getLogger("ai_service")
@@ -83,10 +84,25 @@ TITLE_PROMPT = (
 )
 
 
-def get_system_prompt(user_id: int) -> str:
-    if SUPER_OWNER_ID and user_id == SUPER_OWNER_ID:
-        return _owner_system_prompt()
-    return BASE_SYSTEM_PROMPT
+def get_system_prompt(user_id: int, language: str = "ru", response_style: str = "default") -> str:
+    base = _owner_system_prompt() if (SUPER_OWNER_ID and user_id == SUPER_OWNER_ID) else BASE_SYSTEM_PROMPT
+
+    extra = []
+    if language and language != "ru":
+        lang_info = LANGUAGES.get(language)
+        if lang_info:
+            extra.append(
+                f"ВАЖНО: пользователь выбрал язык интерфейса — отвечай ему на "
+                f"{lang_info['instruction']} языке, если он сам явно не попросит другой."
+            )
+    if response_style and response_style != "default":
+        style_info = RESPONSE_STYLES.get(response_style)
+        if style_info and style_info.get("instruction"):
+            extra.append(f"Стиль ответов, выбранный пользователем: {style_info['instruction']}")
+
+    if extra:
+        return base + "\n\n" + "\n".join(extra)
+    return base
 
 
 # ── Форматирование ошибок ────────────────────────────────────────────────────
@@ -158,10 +174,10 @@ TOOLS = [
                 "уже существующего фото)."
             ),
             parameters=types.Schema(
-                type=types.Type.OBJECT,
+                type="OBJECT",
                 properties={
                     "prompt": types.Schema(
-                        type=types.Type.STRING,
+                        type="STRING",
                         description=(
                             "Подробное описание изображения для генерации: сюжет, стиль, "
                             "цвета, освещение, ракурс. Лучше на английском для максимального "
@@ -182,10 +198,10 @@ TOOLS = [
                 "функцию, если в текущем сообщении нет прикреплённого фото."
             ),
             parameters=types.Schema(
-                type=types.Type.OBJECT,
+                type="OBJECT",
                 properties={
                     "instruction": types.Schema(
-                        type=types.Type.STRING,
+                        type="STRING",
                         description="Чёткое описание того, что нужно изменить на фото.",
                     ),
                 },
@@ -203,14 +219,14 @@ TOOLS = [
                 "'исправь код и пришли готовый файл')."
             ),
             parameters=types.Schema(
-                type=types.Type.OBJECT,
+                type="OBJECT",
                 properties={
                     "filename": types.Schema(
-                        type=types.Type.STRING,
+                        type="STRING",
                         description="Имя файла с расширением, например script.py, статья.docx, план.xlsx, презентация.pptx",
                     ),
                     "file_type": types.Schema(
-                        type=types.Type.STRING,
+                        type="STRING",
                         enum=["text", "docx", "xlsx", "pptx"],
                         description=(
                             "text — код/txt/md/json/html и т.п. (содержимое как есть); "
@@ -220,7 +236,7 @@ TOOLS = [
                         ),
                     ),
                     "content": types.Schema(
-                        type=types.Type.STRING,
+                        type="STRING",
                         description="Полное содержимое файла целиком (не сокращай и не описывай — выдай готовый результат).",
                     ),
                 },
@@ -292,8 +308,16 @@ def guess_mime(filename: str) -> str:
 # ── Потоковый чат ────────────────────────────────────────────────────────────
 
 def _is_overloaded(e: Exception) -> bool:
+    """Google временно перегружен (503 и т.п.) — есть смысл повторить попытку."""
     if isinstance(e, genai_errors.ServerError):
         return True
+    return False
+
+
+def _is_quota_exceeded(e: Exception) -> bool:
+    """429 / RESOURCE_EXHAUSTED / quota — повторять запрос БЕССМЫСЛЕННО: та же
+    квота действует для всех моделей и конфигураций, retry только тратит время
+    пользователя и лишние запросы к API. Нужно сразу показать ошибку."""
     if isinstance(e, genai_errors.ClientError):
         code = getattr(e, "code", None)
         msg = str(e).lower()
@@ -311,6 +335,8 @@ async def stream_chat(
     file_mime: str | None = None,
     user_id: int = 0,
     enable_tools: bool = True,
+    language: str = "ru",
+    response_style: str = "default",
 ):
     """
     Асинхронный генератор, отдающий кусочки текста по мере генерации.
@@ -325,7 +351,7 @@ async def stream_chat(
     if not contents:
         raise AIError("❌ <b>Пустой запрос.</b>\n\nНапиши что-нибудь!")
 
-    system_prompt = get_system_prompt(user_id)
+    system_prompt = get_system_prompt(user_id, language, response_style)
     has_image_attachment = bool(file_bytes) and (file_mime or "").startswith("image/")
     if has_image_attachment and enable_tools and not use_search:
         system_prompt += (
@@ -368,14 +394,25 @@ async def stream_chat(
             tools=_tools(with_search, with_tools),
         )
 
-    attempts = [(model, use_search)]
+    # Цепочка попыток: сначала как запрошено, затем поэтапно упрощаем запрос
+    # (снимаем поиск → снимаем инструменты → пробуем резервные модели одну за
+    # другой), чтобы сбой ОДНОЙ конкретной модели или возможности (например,
+    # в схеме function calling, или Google неожиданно вернул 404 для модели,
+    # которая по документации ещё должна работать — такое подтверждённо
+    # случается) не блокировал обычный чат целиком.
+    attempts = [(model, use_search, enable_tools)]
     if use_search:
-        attempts.append((model, False))
-    if CHAT_FALLBACK_MODEL and CHAT_FALLBACK_MODEL != model:
-        attempts.append((CHAT_FALLBACK_MODEL, False))
+        attempts.append((model, False, enable_tools))
+    if enable_tools:
+        attempts.append((model, False, False))
+    for fallback_model in CHAT_FALLBACK_MODELS:
+        if fallback_model and fallback_model != model and fallback_model not in [a[0] for a in attempts]:
+            attempts.append((fallback_model, False, False))
 
     last_error: Exception | None = None
-    for attempt_index, (try_model, try_search) in enumerate(attempts):
+    attempt_index = 0
+    while attempt_index < len(attempts):
+        try_model, try_search, try_tools = attempts[attempt_index]
         is_last = attempt_index == len(attempts) - 1
         yielded_any = False
         try:
@@ -383,7 +420,7 @@ async def stream_chat(
                 stream = await client.aio.models.generate_content_stream(
                     model=try_model,
                     contents=contents,
-                    config=_config(try_search, enable_tools and not try_search),
+                    config=_config(try_search, try_tools and not try_search),
                 )
                 pieces = []
                 async for chunk in stream:
@@ -429,14 +466,45 @@ async def stream_chat(
                 raise AIError(_format_error(e)) from e
             if not is_last:
                 await asyncio.sleep(1.0)
+                attempt_index += 1
                 continue
             raise AIError(_format_error(e)) from e
         except (genai_errors.ClientError, genai_errors.ServerError) as e:
             last_error = e
             if yielded_any:
                 raise AIError(_format_error(e)) from e
-            if _is_overloaded(e) and not is_last:
-                await asyncio.sleep(1.5)
+            if _is_quota_exceeded(e):
+                # Квота у Gemini обычно раздельная ДЛЯ КАЖДОЙ МОДЕЛИ — если у
+                # основной модели закончился лимит, у резервной модели вполне
+                # может быть собственный запас. Поэтому ищем ближайшую
+                # оставшуюся попытку с ДРУГОЙ моделью и прыгаем сразу к ней,
+                # пропуская бесполезные повторы ТОЙ ЖЕ модели (у неё точно та
+                # же исчерпанная квота).
+                next_idx = next(
+                    (j for j in range(attempt_index + 1, len(attempts))
+                     if attempts[j][0] != try_model),
+                    None,
+                )
+                if next_idx is not None:
+                    logger.warning(
+                        "Квота модели '%s' исчерпана (429) — переключаюсь на "
+                        "модель '%s' (может иметь отдельный лимит)",
+                        try_model, attempts[next_idx][0],
+                    )
+                    attempt_index = next_idx
+                    continue
+                raise AIError(_format_error(e)) from e
+            if not is_last:
+                # Любая другая ClientError (не только перегрузка) — пробуем
+                # следующую, упрощённую попытку: возможно, дело в конкретной
+                # возможности (поиск/инструменты), а не в самом сервисе Gemini.
+                if _is_overloaded(e):
+                    await asyncio.sleep(1.5)
+                logger.warning(
+                    "Попытка %d/%d (модель '%s') не удалась (%r), пробую следующую конфигурацию",
+                    attempt_index + 1, len(attempts), try_model, e,
+                )
+                attempt_index += 1
                 continue
             raise AIError(_format_error(e)) from e
         except Exception as e:
@@ -445,6 +513,7 @@ async def stream_chat(
                 raise AIError(_format_error(e)) from e
             if not is_last:
                 await asyncio.sleep(1.0)
+                attempt_index += 1
                 continue
             raise AIError(_format_error(e)) from e
 

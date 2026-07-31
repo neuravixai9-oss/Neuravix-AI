@@ -71,9 +71,11 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             btn_row.append(InlineKeyboardButton(text=label, callback_data=data))
         rows.append(btn_row)
         rows.append([InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"g:rps:{game_id}:surrender")])
+        from handlers.games.engine import in_progress_buttons
+        rows.append(in_progress_buttons(game_id))
     else:
-        rows.append([InlineKeyboardButton(text="🔄 Играть ещё", callback_data=f"game:rematch:{game_id}")])
-        rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")])
+        from handlers.games.engine import end_game_buttons
+        rows.extend(end_game_buttons(game_id))
 
     return header + players_line, InlineKeyboardMarkup(inline_keyboard=rows)
 

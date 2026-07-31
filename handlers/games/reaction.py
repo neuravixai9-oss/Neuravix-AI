@@ -5,8 +5,6 @@ import time
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from handlers.games.engine import outcome_text, BOT_ID
 
-# Хранит задачи таймеров для каждой игры
-_timers: dict[str, asyncio.Task] = {}
 # Хранит время показа кнопки: game_id -> float (monotonic)
 _shown_at: dict[str, float] = {}
 
@@ -20,6 +18,7 @@ def initial_state(player1_id, player2_id, mode, player1_name="Игрок", playe
         "p1_times": [],
         "p2_times": [],
         "phase": "waiting",  # waiting | ready | done
+        "_round_scheduled": False,
         "last_result": None,
         "player1_name": player1_name,
         "player2_name": player2_name,
@@ -54,10 +53,8 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             f"🔵 {p1_name}: {p1s} побед | ср. {avg_p1:.0f}мс\n"
             f"🔴 {p2_name}: {p2s} побед | ср. {avg_p2:.0f}мс\n\n"
         )
-        buttons = [
-            [InlineKeyboardButton(text="🔄 Реванш", callback_data=f"game:rematch:{game_id}")],
-            [InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")],
-        ]
+        from handlers.games.engine import end_game_buttons
+        buttons = end_game_buttons(game_id)
         return header, InlineKeyboardMarkup(inline_keyboard=buttons)
 
     header = f"⚡ <b>Кто быстрее нажмёт</b> (раунд {rnd + 1}/{max_rnd})\n━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -76,7 +73,8 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         header += "😬 <b>Слишком рано!</b> Подожди кнопки «ЖАТЬ!»"
         buttons.append([InlineKeyboardButton(text="▶️ Попробовать снова", callback_data=f"g:reaction:{game_id}:start")])
 
-    buttons.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+    from handlers.games.engine import in_progress_buttons
+    buttons.append(in_progress_buttons(game_id))
     text = header + players_line
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -141,13 +139,17 @@ async def schedule_reaction_round(session: dict, bot, delay: float = None):
     await asyncio.sleep(delay)
 
     from database.db import get_game_session, update_game_session
-    s = await get_game_session(game_id)
-    if not s or s["status"] != "active":
-        return
-    state = s["state"]
-    state["phase"] = "ready"
-    _shown_at[game_id] = time.monotonic()
-    await update_game_session(game_id, state=state)
+    from handlers.games.engine import _get_game_lock
+
+    async with _get_game_lock(game_id):
+        s = await get_game_session(game_id)
+        if not s or s["status"] != "active":
+            return
+        state = s["state"]
+        state["phase"] = "ready"
+        state["_round_scheduled"] = False  # раунд показан — новый "start" уже не дублирующий
+        _shown_at[game_id] = time.monotonic()
+        await update_game_session(game_id, state=state)
 
     from handlers.games.engine import deliver_to_both
     await deliver_to_both(s, bot)

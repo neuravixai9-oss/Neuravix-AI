@@ -2,6 +2,11 @@ import urllib.parse
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import SUBSCRIPTION_LIMITS, GAMES
 
+# Единый разделитель для заголовков во всём боте — используется во всех
+# разделах (главное меню, профиль, магазин, настройки, помощь, игры, админка),
+# чтобы визуально не было ощущения, что разделы оформлены по-разному.
+DIVIDER = "━" * 20
+
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
@@ -16,7 +21,7 @@ def main_menu_kb(is_super_owner: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [_btn("✨ Нейросеть", "menu:ai")],
         [_btn("🎮 Игры", "menu:games"),      _btn("👤 Профиль", "menu:profile")],
-        [_btn("💎 Подписка", "menu:shop"),   _btn("⚙️ Настройки", "menu:settings")],
+        [_btn("🛒 Магазин", "menu:shop"),   _btn("⚙️ Настройки", "menu:settings")],
         [_btn("❓ Помощь", "menu:help")],
     ]
     if is_super_owner:
@@ -94,10 +99,15 @@ def games_menu_kb(has_active: bool = False) -> InlineKeyboardMarkup:
     rows = []
     if has_active:
         rows.append([_btn("▶️ Продолжить текущую игру", "game:reconnect")])
-    items = list(GAMES.items())
-    for i in range(0, len(items), 2):
-        pair = items[i:i + 2]
-        rows.append([_btn(f"{g['emoji']} {g['title']}", f"game:open:{key}") for key, g in pair])
+
+    last_category = None
+    for key, g in GAMES.items():
+        cat = g.get("category") or "🎮 Игры"
+        if cat != last_category:
+            rows.append([_btn(f"— {cat} —", "shop:noop")])
+            last_category = cat
+        rows.append([_btn(f"{g['emoji']} {g['title']}", f"game:open:{key}")])
+
     rows.append([_btn("🏠 Главное меню", "menu:main")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -153,14 +163,8 @@ def switch_game_kb(room_id: str) -> InlineKeyboardMarkup:
 
 
 # ── Shop ──────────────────────────────────────────────────────────────────────
-
-def shop_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [_btn("🌗 Plus — 120 сообщ/день · 299 ₽/мес", "buy:plus")],
-        [_btn("🌕 Pro — 350 сообщ/день · 799 ₽/мес", "buy:pro")],
-        [_btn("🌟 Ultra — 700 сообщ/день · 1499 ₽/мес", "buy:ultra")],
-        [_btn("🏠 Главное меню", "menu:main")],
-    ])
+# Клавиатура магазина теперь строится динамически из БД (shop_products) прямо
+# в handlers/shop.py — товары полностью управляются из админ-панели.
 
 
 # ── Admin panel ───────────────────────────────────────────────────────────────
@@ -168,6 +172,7 @@ def shop_kb() -> InlineKeyboardMarkup:
 def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("👥 Пользователи", "admin:users:page:0")],
+        [_btn("🛒 Магазин", "admin:shop:list:0")],
         [_btn("➕ Выдать подписку", "admin:give_sub"), _btn("➖ Удалить подписку", "admin:take_sub_list")],
         [_btn("👑 Creator Elite", "admin:give_elite"), _btn("🛡️ Управление админами", "admin:manage_admins")],
         [_btn("📢 Рассылка", "admin:broadcast"), _btn("📤 Экспорт польз.", "admin:user_list")],
@@ -282,12 +287,56 @@ def text_writer_kb() -> InlineKeyboardMarkup:
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
-def settings_kb(ai_enabled: bool = True) -> InlineKeyboardMarkup:
+def settings_kb(ai_enabled: bool = True, language: str = "ru", response_style: str = "default", model_preference: str = "auto") -> InlineKeyboardMarkup:
+    from config import LANGUAGES, RESPONSE_STYLES
     ai_status = "✅ Включена" if ai_enabled else "⭕ Отключена"
+    lang_label = LANGUAGES.get(language, LANGUAGES["ru"])["label"]
+    style_label = RESPONSE_STYLES.get(response_style, RESPONSE_STYLES["default"])["label"]
+    model_label = "⚡ Всегда быстрая" if model_preference == "fast" else "🎯 Авто (по тарифу)"
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn(f"✨ Нейросеть: {ai_status}", "settings:toggle_ai")],
-        [_btn("🗑️ Удалить все диалоги", "settings:clear_history_confirm")],
+        [_btn(f"🌍 Язык: {lang_label}", "settings:language")],
+        [_btn(f"🎨 Стиль: {style_label}", "settings:style")],
+        [_btn(f"🧠 Модель: {model_label}", "settings:model")],
+        [_btn("🧹 Очистить историю", "settings:clear_history_confirm")],
+        [_btn("♻️ Сбросить настройки", "settings:reset_confirm")],
         [_btn("🏠 Главное меню", "menu:main")],
+    ])
+
+
+def settings_language_kb(current: str) -> InlineKeyboardMarkup:
+    from config import LANGUAGES
+    rows = []
+    for code, info in LANGUAGES.items():
+        mark = " ✅" if code == current else ""
+        rows.append([_btn(f"{info['label']}{mark}", f"settings:language:{code}")])
+    rows.append([_btn("⬅️ Назад", "menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_style_kb(current: str) -> InlineKeyboardMarkup:
+    from config import RESPONSE_STYLES
+    rows = []
+    for key, info in RESPONSE_STYLES.items():
+        mark = " ✅" if key == current else ""
+        rows.append([_btn(f"{info['label']}{mark}", f"settings:style:{key}")])
+    rows.append([_btn("⬅️ Назад", "menu:settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_model_kb(current: str) -> InlineKeyboardMarkup:
+    auto_mark = " ✅" if current != "fast" else ""
+    fast_mark = " ✅" if current == "fast" else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn(f"🎯 Авто (по тарифу){auto_mark}", "settings:model:auto")],
+        [_btn(f"⚡ Всегда быстрая{fast_mark}", "settings:model:fast")],
+        [_btn("⬅️ Назад", "menu:settings")],
+    ])
+
+
+def settings_reset_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("✅ Да, сбросить", "settings:reset"), _btn("✖️ Отмена", "menu:settings")],
     ])
 
 

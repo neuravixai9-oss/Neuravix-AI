@@ -4,40 +4,69 @@ from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 
 from database.db import get_or_create_user
-from keyboards.menus import main_menu_kb, back_to_main_kb
-from config import SUPER_OWNER_ID
+from keyboards.menus import main_menu_kb, back_to_main_kb, DIVIDER
+from config import SUPER_OWNER_ID, SUBSCRIPTION_LIMITS
 
 router = Router()
+
+_SUB_ICONS = {
+    "free": "🌑", "plus": "🌗", "pro": "🌕", "ultra": "🌟", "creator_elite": "👑",
+}
 
 
 def html_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-WELCOME_TEXT = (
-    "✨ <b>Neuravix AI</b>\n"
-    "━━━━━━━━━━━━━━━━━━━━\n\n"
-    "Привет, <b>{name}</b>! 👋\n\n"
-    "Твой персональный ИИ-ассистент готов к работе.\n\n"
-    "🤖 <b>Нейросеть</b> — отвечу на любые вопросы\n"
-    "🖼️ <b>Изображения</b> — генерация по описанию\n"
-    "🎮 <b>Игры</b> — 8 мини-игр с другом или ботом\n"
-    "🌐 <b>Переводчик</b> — мгновенный перевод\n"
-    "🪶 <b>Тексты</b> — статьи, посты, письма\n\n"
-    "👇 Выбери раздел:"
-)
+def _status_line(user: dict) -> str:
+    """Короткая персонализированная строка статуса — тариф и остаток лимита
+    на сегодня. Делает приветствие похожим на персональную панель, а не на
+    статичный текст, одинаковый для всех."""
+    sub = user.get("subscription", "free")
+    info = SUBSCRIPTION_LIMITS.get(sub, SUBSCRIPTION_LIMITS["free"])
+    icon = _SUB_ICONS.get(sub, "🌑")
+    limit = info.get("messages_per_day", 0)
+    used = user.get("messages_today", 0) or 0
+    if limit == -1:
+        quota = "сообщения без лимита"
+    else:
+        left = max(0, limit - used)
+        quota = f"осталось {left} из {limit} сообщений сегодня"
+    return f"{icon} <b>{info.get('label', sub)}</b> · {quota}"
 
-OWNER_WELCOME_TEXT = (
-    "👑 <b>Добро пожаловать, создатель!</b>\n\n"
-    "Neuravix AI готов к работе.\n\n"
-    "👇 Выбери раздел:"
-)
+
+def main_menu_text(name: str, is_owner: bool, user: dict | None = None) -> str:
+    """
+    Единственный источник текста главного меню — используется и в /start,
+    и в /menu, и в кнопке «⬅️ В меню» откуда угодно. Так меню гарантированно
+    выглядит одинаково независимо от того, как в него попал пользователь.
+    """
+    status = f"\n{_status_line(user)}\n" if user else ""
+
+    if is_owner:
+        return (
+            "👑 <b>Neuravix AI</b>\n"
+            f"{DIVIDER}\n\n"
+            f"Добро пожаловать, создатель, <b>{html_escape(name)}</b>! 👋\n"
+            f"{status}\n"
+            "👇 Выбери раздел:"
+        )
+    return (
+        "✨ <b>Neuravix AI</b>\n"
+        f"{DIVIDER}\n\n"
+        f"Привет, <b>{html_escape(name)}</b>! 👋\n"
+        f"{status}\n"
+        "Просто напиши, что нужно — сам разберусь:\n"
+        "🎨 <i>«нарисуй…»</i> · 🌐 <i>«переведи…»</i> · "
+        "💻 <i>«исправь код…»</i> · 📝 <i>«напиши текст…»</i>\n\n"
+        "👇 Выбери раздел:"
+    )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext, bot=None):
     await state.clear()
-    await get_or_create_user(
+    user = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name or "Пользователь",
@@ -54,13 +83,8 @@ async def cmd_start(message: Message, state: FSMContext, bot=None):
     is_owner = (message.from_user.id == SUPER_OWNER_ID)
     name = message.from_user.first_name or "Пользователь"
 
-    if is_owner:
-        text = OWNER_WELCOME_TEXT
-    else:
-        text = WELCOME_TEXT.format(name=html_escape(name))
-
     await message.answer(
-        text,
+        main_menu_text(name, is_owner, user),
         reply_markup=main_menu_kb(is_super_owner=is_owner),
         parse_mode="HTML",
     )
@@ -69,24 +93,18 @@ async def cmd_start(message: Message, state: FSMContext, bot=None):
 @router.callback_query(F.data == "menu:main")
 async def back_to_main(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await get_or_create_user(
+    user = await get_or_create_user(
         telegram_id=callback.from_user.id,
         username=callback.from_user.username,
         first_name=callback.from_user.first_name or "Пользователь",
     )
     is_owner = (callback.from_user.id == SUPER_OWNER_ID)
+    name = callback.from_user.first_name or "Пользователь"
+    text = main_menu_text(name, is_owner, user)
 
-    if is_owner:
-        text = OWNER_WELCOME_TEXT
-    else:
-        name = html_escape(callback.from_user.first_name or "Пользователь")
-        text = (
-            "🏠 <b>Главное меню</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Привет, <b>{name}</b>! Чем могу помочь?\n\n"
-            "👇 Выбери раздел:"
-        )
-
+    # Меню всегда РЕДАКТИРУЕТСЯ на месте — новое сообщение отправляется только
+    # если редактирование в принципе невозможно (например, исходное сообщение
+    # было фото/файлом без текста, или удалено).
     try:
         await callback.message.edit_text(
             text,
@@ -94,6 +112,10 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
     except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
         await callback.message.answer(
             text,
             reply_markup=main_menu_kb(is_super_owner=is_owner),
@@ -105,24 +127,15 @@ async def back_to_main(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext):
     await state.clear()
-    await get_or_create_user(
+    user = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
         first_name=message.from_user.first_name or "Пользователь",
     )
     is_owner = (message.from_user.id == SUPER_OWNER_ID)
-    if is_owner:
-        text = OWNER_WELCOME_TEXT
-    else:
-        name = html_escape(message.from_user.first_name or "Пользователь")
-        text = (
-            "🏠 <b>Главное меню</b>\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Привет, <b>{name}</b>! Чем могу помочь?\n\n"
-            "👇 Выбери раздел:"
-        )
+    name = message.from_user.first_name or "Пользователь"
     await message.answer(
-        text,
+        main_menu_text(name, is_owner, user),
         reply_markup=main_menu_kb(is_super_owner=is_owner),
         parse_mode="HTML",
     )

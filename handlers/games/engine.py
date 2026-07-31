@@ -27,6 +27,45 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 _GAMES: dict = {}
 
+# Блокировка на каждую игровую сессию отдельно (не глобальная!) — гарантирует,
+# что два хода в ОДНОЙ и той же игре (например, одновременное нажатие двумя
+# игроками в "Кто быстрее нажмёт", или случайный двойной тап) обрабатываются
+# строго по очереди, а не гонкой состояний "прочитали одно и то же — записали
+# по очереди, одно из изменений потерялось". Игры друг на друга не влияют.
+_game_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_game_lock(game_id: str) -> asyncio.Lock:
+    lock = _game_locks.get(game_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _game_locks[game_id] = lock
+    return lock
+
+
+def _release_game_lock(game_id: str):
+    """Убирает блокировку завершённой/удалённой игры, чтобы _game_locks не
+    рос бесконечно с каждой новой сыгранной партией."""
+    _game_locks.pop(game_id, None)
+
+
+def end_game_buttons(game_id: str) -> list[list[InlineKeyboardButton]]:
+    """
+    Единые кнопки экрана окончания игры — используются ВСЕМИ играми, чтобы
+    не было ощущения, что разные игры оформлены по-разному (было: где-то
+    'Реванш', где-то 'Играть снова', где-то 'Все игры', где-то 'В меню').
+    """
+    return [
+        [InlineKeyboardButton(text="🔄 Играть ещё", callback_data=f"game:rematch:{game_id}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")],
+    ]
+
+
+def in_progress_buttons(game_id: str) -> list[InlineKeyboardButton]:
+    """Единая нижняя строка-кнопка 'Все игры' для экрана игры В ПРОЦЕССЕ
+    (позволяет выйти, не доигрывая — отдельно от экрана окончания)."""
+    return [InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")]
+
 
 def register_game(name: str, module):
     _GAMES[name] = module
@@ -143,6 +182,14 @@ async def create_session(
     if not game_mod:
         raise ValueError(f"Неизвестная игра: {game_type}")
 
+    # ВАЖНО: имя ожидается УЖЕ экранированным (html.escape) вызывающим кодом —
+    # см. handlers/games/__init__.py и handlers/games/menu.py. Экранировать
+    # здесь ещё раз нельзя: при реванше сюда попадает имя, взятое из старого
+    # state, которое уже экранировано, и повторное экранирование испортит его
+    # (& станет &amp;amp; и т.д.)
+    player1_name = player1_name or "Игрок"
+    player2_name = player2_name or "Игрок"
+
     game_id = uuid.uuid4().hex[:10]
     state = game_mod.initial_state(
         player1_id=player1_id,
@@ -179,26 +226,32 @@ async def accept_friend_invite(
 ) -> Optional[dict]:
     from database.db import get_game_session, update_game_session
 
-    session = await get_game_session(game_id)
-    if not session or session["status"] != "waiting":
-        return None
-    if session["player1_id"] == joiner_id:
-        return None
+    # Блокировка — без неё два разных человека, кликнувших по одному и тому
+    # же приглашению почти одновременно, могли оба пройти проверку "место
+    # свободно" и оба стать "вторым игроком"; выигрывал тот, чья запись в
+    # БД была последней, а второй продолжал бы играть в игре, где его уже
+    # не признают.
+    async with _get_game_lock(game_id):
+        session = await get_game_session(game_id)
+        if not session or session["status"] != "waiting":
+            return None
+        if session["player1_id"] == joiner_id:
+            return None
 
-    game_mod = get_game(session["game_type"])
-    if not game_mod:
-        return None
+        game_mod = get_game(session["game_type"])
+        if not game_mod:
+            return None
 
-    state = session["state"]
-    state["player2_name"] = joiner_name
+        state = session["state"]
+        state["player2_name"] = joiner_name or "Игрок"
 
-    await update_game_session(
-        game_id,
-        player2_id=joiner_id,
-        status="active",
-        state=state,
-    )
-    return await get_game_session(game_id)
+        await update_game_session(
+            game_id,
+            player2_id=joiner_id,
+            status="active",
+            state=state,
+        )
+        return await get_game_session(game_id)
 
 
 # ── Обработка хода ─────────────────────────────────────────────────────────────
@@ -207,8 +260,25 @@ async def process_move(
     session: dict, payload: str, user_id: int, bot
 ) -> Optional[str]:
     """
+    Публичная точка входа для хода в игре. Берёт блокировку НА КОНКРЕТНУЮ
+    игровую сессию (не глобальную), чтобы два хода в одной и той же игре —
+    например, одновременное нажатие двумя игроками в "Кто быстрее нажмёт"
+    или случайный двойной тап — обрабатывались строго по очереди, а не
+    гонкой состояний. Реальная логика — в _process_move_inner.
+    """
+    game_id = session["game_id"]
+    async with _get_game_lock(game_id):
+        return await _process_move_inner(session, payload, user_id, bot)
+
+
+async def _process_move_inner(
+    session: dict, payload: str, user_id: int, bot
+) -> Optional[str]:
+    """
     Выполняет ход, обновляет БД, доставляет сообщение.
     Возвращает outcome или None.
+    ВАЖНО: вызывать только из process_move() (под блокировкой) или отсюда же
+    рекурсивно (ход бота) — НИКОГДА напрямую, иначе гонка состояний вернётся.
     """
     from database.db import get_game_session, update_game_session, delete_game_session
 
@@ -235,6 +305,7 @@ async def process_move(
         new_session["status"] = "finished"
         await update_game_session(game_id, state=new_session["state"], status="finished")
         await deliver_to_both(new_session, bot)
+        _release_game_lock(game_id)
         return outcome
 
     await update_game_session(
@@ -271,11 +342,15 @@ async def process_move(
         if bot_payload is not None:
             refreshed = await get_game_session(game_id)
             if refreshed and refreshed["status"] == "active":
-                return await process_move(refreshed, bot_payload, BOT_ID, bot)
+                # Рекурсия в ТУ ЖЕ (уже заблокированную снаружи) реализацию —
+                # НЕ через process_move(), иначе повторный вход в тот же lock
+                # приведёт к вечному ожиданию (asyncio.Lock не реентерабельна).
+                return await _process_move_inner(refreshed, bot_payload, BOT_ID, bot)
         else:
             await update_game_session(game_id, status="finished")
             new_session["status"] = "finished"
             await deliver_to_both(new_session, bot)
+            _release_game_lock(game_id)
             return "draw"
     else:
         await deliver_to_both(new_session, bot)

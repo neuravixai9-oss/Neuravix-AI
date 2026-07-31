@@ -103,10 +103,12 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         board_rows.append(row_btns)
 
     if is_done:
-        board_rows.append([InlineKeyboardButton(text="🔄 Реванш", callback_data=f"game:rematch:{game_id}")])
+        from handlers.games.engine import end_game_buttons
+        board_rows.extend(end_game_buttons(game_id))
     else:
         board_rows.append([InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"g:memory:{game_id}:surrender")])
-    board_rows.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        from handlers.games.engine import in_progress_buttons
+        board_rows.append(in_progress_buttons(game_id))
 
     text = header + players_line
     return text, InlineKeyboardMarkup(inline_keyboard=board_rows)
@@ -124,6 +126,10 @@ def handle_move(session: dict, payload: str, user_id: int) -> tuple[dict, str | 
 
     # Пока идёт показ несовпавшей пары — новые ходы не принимаем
     if state.get("_pending_hide"):
+        return session, None
+
+    # Серверная проверка очереди хода — доп. защита сверх UI-блокировки кнопок.
+    if payload not in ("noop", "surrender") and user_id != session.get("current_turn"):
         return session, None
 
     try:

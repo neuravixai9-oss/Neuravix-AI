@@ -68,8 +68,11 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     buttons = []
     if is_done:
-        buttons.append([InlineKeyboardButton(text="🔄 Играть снова", callback_data=f"game:rematch:{game_id}")])
-    buttons.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        from handlers.games.engine import end_game_buttons
+        buttons.extend(end_game_buttons(game_id))
+    else:
+        from handlers.games.engine import in_progress_buttons
+        buttons.append(in_progress_buttons(game_id))
 
     return header, InlineKeyboardMarkup(inline_keyboard=buttons)
 

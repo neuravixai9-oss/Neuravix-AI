@@ -83,12 +83,12 @@ def render(session: dict, for_user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             row_btns.append(InlineKeyboardButton(text=label, callback_data=data))
         rows.append(row_btns)
 
+    from handlers.games.engine import end_game_buttons, in_progress_buttons
     if is_done:
-        rows.append([InlineKeyboardButton(text="🔄 Реванш", callback_data=f"game:rematch:{game_id}")])
-        rows.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        rows.extend(end_game_buttons(game_id))
     else:
         rows.append([InlineKeyboardButton(text="🏳️ Сдаться", callback_data=f"g:tictactoe:{game_id}:surrender")])
-        rows.append([InlineKeyboardButton(text="📋 Все игры", callback_data="menu:games")])
+        rows.append(in_progress_buttons(game_id))
 
     text = header + players_line
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -100,6 +100,12 @@ def handle_move(session: dict, payload: str, user_id: int) -> tuple[dict, str | 
     if payload == "surrender":
         session["state"]["_outcome"] = "win_p2" if user_id == session["player1_id"] else "win_p1"
         return session, session["state"]["_outcome"]
+
+    # Серверная проверка очереди хода — в обычной игре кнопки для чужого
+    # хода и так задизейблены в интерфейсе, но это доп. защита на случай
+    # подделанного запроса в обход кнопок (не только UI-проверка).
+    if user_id != session.get("current_turn"):
+        return session, None
 
     board = list(session["state"]["board"])
     try:
