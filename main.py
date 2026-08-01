@@ -137,8 +137,21 @@ async def main():
         f"🗄️ База данных: {'PostgreSQL (DATABASE_URL)' if USE_POSTGRES else 'SQLite (локальный файл)'}"
     )
 
+    postgres_ok = True
     if USE_POSTGRES:
-        await init_pg_pool()
+        postgres_ok = await init_pg_pool()
+        if not postgres_ok:
+            from database import db_backend
+            logger.error(
+                "❌ Не удалось подключиться к PostgreSQL "
+                f"(DATABASE_URL): {db_backend._pg_connection_error}\n"
+                "   Бот НЕ падает — автоматически продолжает работу на "
+                "SQLite. Проверь переменную DATABASE_URL в Railway "
+                "(правильный ли адрес, доступна ли БД) и передеплой, когда "
+                "исправишь — тогда бот снова переключится на PostgreSQL."
+            )
+        else:
+            logger.info("✅ Подключение к PostgreSQL установлено")
 
     # Резервная копия БД перед миграциями — если что-то пойдёт не так при
     # обновлении схемы, данные всегда можно восстановить из свежего бэкапа.
@@ -341,8 +354,7 @@ async def main():
         )
     finally:
         await bot.session.close()
-        if USE_POSTGRES:
-            await close_pg_pool()
+        await close_pg_pool()  # безопасно — ничего не делает, если пула не было
         logger.info("🔴 Бот остановлен")
 
 

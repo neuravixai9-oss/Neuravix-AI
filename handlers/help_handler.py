@@ -1,13 +1,28 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from keyboards.menus import back_to_main_kb
-from config import SUPPORT_USERNAME
+from config import SUPPORT_USERNAME, SUBSCRIPTION_LIMITS
 
 router = Router()
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def _image_limits_block() -> str:
+    """Строится из SUBSCRIPTION_LIMITS, а не хардкодится — если лимиты
+    поменяются в конфиге, эта справка не отстанет от реальности."""
+    lines = []
+    icons = {"free": "🌑", "plus": "🌗", "pro": "🌕", "ultra": "🌟"}
+    for key in ("free", "plus", "pro", "ultra"):
+        info = SUBSCRIPTION_LIMITS.get(key, {})
+        limit = info.get("images_per_day")
+        if limit is None:
+            continue
+        limit_str = "без лимита" if limit == -1 else f"{limit} изображений/день"
+        lines.append(f"{icons.get(key, '•')} {info.get('label', key)} — {limit_str}")
+    return "\n".join(lines)
 
 
 HELP_SECTIONS = {
@@ -49,10 +64,7 @@ HELP_SECTIONS = {
         "<b>Редактирование фото:</b> пришли фото с подписью, что изменить — "
         "«удали человека справа», «замени фон на пляж», «сделай чёрно-белым».\n\n"
         "<b>Лимиты (генерация и редактирование вместе):</b>\n"
-        "🌑 Free — 5 изображений/день\n"
-        "🌗 Plus — 30 изображений/день\n"
-        "🌕 Pro — 100 изображений/день\n"
-        "🌟 Ultra — 200 изображений/день"
+        + _image_limits_block()
     ),
     "games": (
         "🎮 <b>Игры — подробнее</b>\n"
@@ -72,29 +84,14 @@ HELP_SECTIONS = {
         "<b>Приглашение</b> действует 5 минут"
     ),
     "subs": (
-        "💎 <b>Тарифы — подробнее</b>\n"
+        "💎 <b>Тарифы</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🌑 <b>Free (бесплатно)</b>\n"
-        "• 35 сообщений/день\n"
-        "• 5 изображений/день\n"
-        "• Модель: Gemini 2.0 Flash Lite\n"
-        "• Анализ фото и файлов ✅\n\n"
-        "🌗 <b>Plus — 299 ₽/мес</b>\n"
-        "• 120 сообщений/день\n"
-        "• 30 изображений/день\n"
-        "• Модель: Gemini 2.0 Flash\n"
-        "• Поиск в интернете ✅\n\n"
-        "🌕 <b>Pro — 799 ₽/мес</b>\n"
-        "• 350 сообщений/день\n"
-        "• 100 изображений/день\n"
-        "• Модель: Gemini 2.5 Flash\n"
-        "• Поиск в интернете ✅\n\n"
-        "🌟 <b>Ultra — 1499 ₽/мес</b>\n"
-        "• 700 сообщений/день\n"
-        "• 200 изображений/день\n"
-        "• Модель: Gemini 2.5 Flash\n"
-        "• Максимальная скорость ✅\n\n"
-        + (f"Для оформления: @{SUPPORT_USERNAME}" if SUPPORT_USERNAME else "Для оформления обратись к администратору бота.")
+        "Актуальные тарифы и цены — в разделе «🛒 Магазин»: там всегда "
+        "показаны действующие цены и условия, без риска, что справка тут "
+        "отстанет от реальных цен.\n\n"
+        "Каждый платный тариф даёт больше сообщений и изображений в день, "
+        "доступ к поиску в интернете и более быструю модель — сравнить всё "
+        "можно прямо в карточках товаров в магазине."
     ),
 }
 
@@ -102,14 +99,14 @@ SECTION_TITLES = {
     "ai": "🤖 Нейросеть",
     "image": "🖼️ Изображения",
     "games": "🎮 Игры",
-    "subs": "💎 Тарифы",
+    "subs": "🛒 Магазин",
 }
 
 
 def _help_main_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [_btn("🤖 Нейросеть", "help:ai"),       _btn("🖼️ Изображения", "help:image")],
-        [_btn("🎮 Игры", "help:games"),           _btn("💎 Тарифы", "help:subs")],
+        [_btn("🎮 Игры", "help:games"),           _btn("🛒 Магазин", "help:subs")],
         [_btn("📩 Написать в поддержку", "help:support")],
         [_btn("🏠 Главное меню", "menu:main")],
     ])
@@ -117,6 +114,13 @@ def _help_main_kb() -> InlineKeyboardMarkup:
 
 def _section_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("⬅️ Назад к помощи", "menu:help")],
+    ])
+
+
+def _subs_section_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [_btn("🛒 Открыть магазин", "menu:shop")],
         [_btn("⬅️ Назад к помощи", "menu:help")],
     ])
 
@@ -130,7 +134,7 @@ MAIN_HELP_TEXT = (
     "🤖 <b>Нейросеть</b> — общение, анализ файлов и фото\n"
     "🖼️ <b>Изображения</b> — как генерировать и советы\n"
     "🎮 <b>Игры</b> — список игр и режимы\n"
-    "💎 <b>Тарифы</b> — сравнение планов и цены\n\n"
+    "🛒 <b>Магазин</b> — тарифы, цены и покупки\n\n"
     "━━━━━━━━━━━━━━━━━━━━\n\n"
     f"{_SUPPORT_LINE}"
     "<i>Мы всегда на связи — пиши, если что-то не работает!</i>"
@@ -165,12 +169,13 @@ async def open_help_section(callback: CallbackQuery):
         await callback.answer("Раздел не найден", show_alert=True)
         return
 
+    kb = _subs_section_kb() if section == "subs" else _section_kb()
     try:
         await callback.message.edit_text(
-            text, reply_markup=_section_kb(), parse_mode="HTML"
+            text, reply_markup=kb, parse_mode="HTML"
         )
     except Exception:
         await callback.message.answer(
-            text, reply_markup=_section_kb(), parse_mode="HTML"
+            text, reply_markup=kb, parse_mode="HTML"
         )
     await callback.answer()

@@ -305,6 +305,34 @@ def _safe_escape(text: str) -> str:
     return html.escape(text)[:4000]
 
 
+_THINKING_FRAMES = ["🧠 <i>Думаю</i>", "🧠 <i>Думаю.</i>", "🧠 <i>Думаю..</i>", "🧠 <i>Думаю...</i>"]
+
+
+async def _animate_thinking(placeholder: Message, chat_id: str):
+    """
+    Лёгкая анимация ожидания первого токена ответа — вместо статичного
+    '⏳ Думаю…' сообщение живо меняется, пока нейросеть генерирует первый
+    кусочек ответа. Безопасно отменяется извне (asyncio.CancelledError),
+    как только реальный текст начал приходить — тогда его подхватывает
+    обычное потоковое редактирование.
+    """
+    i = 0
+    try:
+        while True:
+            await asyncio.sleep(1.1)
+            i += 1
+            try:
+                await placeholder.edit_text(
+                    _THINKING_FRAMES[i % len(_THINKING_FRAMES)],
+                    parse_mode="HTML",
+                    reply_markup=stop_generation_kb(chat_id),
+                )
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        pass
+
+
 async def _run_generation(
     user_id: int,
     chat_id: str,
@@ -319,6 +347,7 @@ async def _run_generation(
     bot,
     language: str = "ru",
     response_style: str = "default",
+    thinking_task: asyncio.Task | None = None,
 ):
     from services.ai_service import stream_chat, AIError, generate_title, ToolCall
 
@@ -328,6 +357,10 @@ async def _run_generation(
     has_output = False
     tool_call = None
 
+    def _stop_thinking_animation():
+        if thinking_task and not thinking_task.done():
+            thinking_task.cancel()
+
     try:
         async for piece in stream_chat(
             history, model=model, max_tokens=max_tokens, use_search=use_search,
@@ -336,8 +369,11 @@ async def _run_generation(
         ):
             if isinstance(piece, ToolCall):
                 tool_call = piece
+                _stop_thinking_animation()
                 break
             buffer += piece
+            if not has_output:
+                _stop_thinking_animation()  # первый кусочек текста — анимация больше не нужна
             has_output = True
             now = time.monotonic()
             if now - last_edit >= EDIT_INTERVAL:
@@ -383,6 +419,7 @@ async def _run_generation(
         return
     finally:
         active_generations.pop(user_id, None)
+        _stop_thinking_animation()
 
     if tool_call is not None and not stopped:
         await _execute_tool_call(
@@ -644,15 +681,16 @@ async def handle_ai_message(message: Message, state: FSMContext, bot=None):
     response_style = user.get("response_style") or "default"
 
     placeholder = await message.answer(
-        "⏳ <i>Думаю…</i>",
+        "🧠 <i>Думаю</i>",
         parse_mode="HTML",
         reply_markup=stop_generation_kb(chat_id)
     )
+    thinking_task = asyncio.create_task(_animate_thinking(placeholder, chat_id))
 
     task = asyncio.create_task(_run_generation(
         message.from_user.id, chat_id, placeholder, history, model, max_tokens,
         use_search, file_bytes, file_name, file_mime, bot,
-        language, response_style,
+        language, response_style, thinking_task,
     ))
     active_generations[message.from_user.id] = {"task": task, "chat_id": chat_id}
 

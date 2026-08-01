@@ -33,15 +33,37 @@ else:
 
 
 _pg_pool = None
+_pg_connection_error: str | None = None
 
 
-async def init_pg_pool():
-    """Создаёт пул соединений PostgreSQL один раз при старте бота. Для SQLite
-    не требуется (там каждое соединение — быстрый локальный файл)."""
-    global _pg_pool
-    if not USE_POSTGRES or _pg_pool is not None:
-        return
-    _pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+async def init_pg_pool() -> bool:
+    """
+    Создаёт пул соединений PostgreSQL один раз при старте бота. Для SQLite
+    не требуется (там каждое соединение — быстрый локальный файл).
+
+    ВАЖНО: если подключиться не удалось (недоступен хост, неверный
+    DATABASE_URL, БД ещё не готова и т.п.) — НЕ роняет бота. Вместо этого
+    откатывается на SQLite и возвращает False, чтобы вызывающий код мог
+    залогировать понятную причину. Раньше ошибка подключения (например
+    socket.gaierror при недоступном DNS) падала необработанной и убивала
+    весь процесс — это была причина полного краша (Crashed) на Railway.
+    """
+    global _pg_pool, USE_POSTGRES, _pg_connection_error
+    if not USE_POSTGRES:
+        return False
+    if _pg_pool is not None:
+        return True
+    try:
+        _pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        return True
+    except Exception as e:
+        _pg_connection_error = repr(e)
+        # Откатываемся на SQLite — get_connection() ниже читает USE_POSTGRES
+        # заново при каждом вызове (не хранит закешированное значение),
+        # поэтому эта правка сразу подхватится всем database/db.py.
+        USE_POSTGRES = False
+        _pg_pool = None
+        return False
 
 
 async def close_pg_pool():
@@ -151,7 +173,14 @@ async def get_connection(sqlite_path: str):
     """
     if USE_POSTGRES:
         if _pg_pool is None:
-            await init_pg_pool()
+            ok = await init_pg_pool()
+            if not ok:
+                # init_pg_pool() уже откатил USE_POSTGRES на False при неудаче —
+                # используем SQLite прямо в этом вызове, не пытаясь достучаться
+                # до несуществующего пула.
+                async with aiosqlite.connect(sqlite_path) as db:
+                    yield db
+                return
         async with _pg_pool.acquire() as raw_conn:
             yield _PGConn(raw_conn)
     else:

@@ -68,38 +68,16 @@ async def admin_panel(callback: CallbackQuery):
     total = stats["total"]
     active_today = stats["active_today"]
     subs = stats.get("subscriptions", {})
-
     paying = sum(v for k, v in subs.items() if k != "free")
-    free_count = subs.get("free", 0)
 
     text = (
         "👑 <b>Панель управления Neuravix AI</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         f"👥 Всего пользователей: <b>{total}</b>\n"
         f"⚡ Активны сегодня: <b>{active_today}</b>\n"
-        f"🆕 Новых: сегодня <b>{stats.get('new_today', 0)}</b> / "
-        f"неделя <b>{stats.get('new_week', 0)}</b> / месяц <b>{stats.get('new_month', 0)}</b>\n"
-        f"💤 Заблокировали бота: <b>{stats.get('blocked_bot', 0)}</b>\n"
-        f"🚫 Забанено владельцем: <b>{stats.get('banned', 0)}</b>\n"
-        f"💎 Платных подписок: <b>{paying}</b>\n"
-        f"🌑 Бесплатных: <b>{free_count}</b>\n"
+        f"💎 Платных подписок: <b>{paying}</b>\n\n"
+        f"{'━' * 20}\n<i>Neuravix AI v{VERSION} • {date.today().strftime('%d.%m.%Y')}</i>"
     )
-
-    if subs:
-        text += "\n📊 <b>По тарифам:</b>\n"
-        labels = {
-            "free": "🌑 Free",
-            "plus": "🌗 Plus",
-            "pro": "🌕 Pro",
-            "ultra": "🌟 Ultra",
-            "creator_elite": "👑 Creator Elite",
-        }
-        for sub_key in ["creator_elite", "ultra", "pro", "plus", "free"]:
-            cnt = subs.get(sub_key, 0)
-            if cnt:
-                text += f"  • {labels.get(sub_key, sub_key)}: <b>{cnt}</b>\n"
-
-    text += f"\n{'━' * 20}\n<i>Neuravix AI v{VERSION} • {date.today().strftime('%d.%m.%Y')}</i>"
 
     try:
         await callback.message.edit_text(text, reply_markup=admin_panel_kb(), parse_mode="HTML")
@@ -114,7 +92,45 @@ async def show_stats(callback: CallbackQuery):
     if not _is_admin(user):
         await callback.answer("❌ Нет доступа", show_alert=True)
         return
-    await admin_panel(callback)
+
+    stats = await get_stats()
+    subs = stats.get("subscriptions", {})
+    paying = sum(v for k, v in subs.items() if k != "free")
+    free_count = subs.get("free", 0)
+
+    text = (
+        "📊 <b>Подробная статистика</b>\n"
+        f"{DIVIDER}\n\n"
+        f"👥 Всего пользователей: <b>{stats['total']}</b>\n"
+        f"⚡ Активны сегодня: <b>{stats['active_today']}</b>\n"
+        f"🆕 Новых: сегодня <b>{stats.get('new_today', 0)}</b> / "
+        f"неделя <b>{stats.get('new_week', 0)}</b> / месяц <b>{stats.get('new_month', 0)}</b>\n"
+        f"💤 Заблокировали бота: <b>{stats.get('blocked_bot', 0)}</b>\n"
+        f"🚫 Забанено владельцем: <b>{stats.get('banned', 0)}</b>\n\n"
+        f"{DIVIDER}\n\n"
+        f"💎 Платных подписок: <b>{paying}</b>\n"
+        f"🌑 Бесплатных: <b>{free_count}</b>\n"
+    )
+    if subs:
+        text += "\n📊 <b>По тарифам:</b>\n"
+        labels = {
+            "free": "🌑 Free", "plus": "🌗 Plus", "pro": "🌕 Pro",
+            "ultra": "🌟 Ultra", "creator_elite": "👑 Creator Elite",
+        }
+        for sub_key in ["creator_elite", "ultra", "pro", "plus", "free"]:
+            cnt = subs.get(sub_key, 0)
+            if cnt:
+                text += f"  • {labels.get(sub_key, sub_key)}: <b>{cnt}</b>\n"
+
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Панель", callback_data="admin:panel")],
+    ])
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
 
 
 # ── Список пользователей (интерактивный, с блокировкой) ───────────────────────

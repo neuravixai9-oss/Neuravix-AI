@@ -20,7 +20,8 @@ async def _settings_text_and_kb(telegram_id: int):
     text = (
         "⚙️ <b>Настройки</b>\n"
         f"{DIVIDER}\n\n"
-        "Управляй параметрами бота под себя:"
+        "Настрой бота под себя — язык, стиль общения, модель и хранение "
+        "истории. Нажми на пункт, чтобы изменить:"
     )
     return text, settings_kb(ai_on, language, style, model_pref)
 
